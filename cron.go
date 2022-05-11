@@ -12,14 +12,18 @@ import (
 // be inspected while running.
 // Cron 跟踪任意数量的 entries，调用 调度指定的关联函数。 它可以启动、停止，并且可以在运行时检查条目。
 type Cron struct {
+	// 存放添加到 Cron 的所有 Entry
 	entries   []*Entry
 	chain     Chain
 	stop      chan struct{}
+
+	// 添加 Entry 时，如果 running 字段为 true，则将要添加的 Entry 放到这个 chan 中。
 	add       chan *Entry
 	remove    chan EntryID
 	snapshot  chan chan []Entry
 
-	// 默认值: false
+	// 默认值: false, 通过 runningMu 锁进行保护
+	// 在调用 Start() 函数后, 会将 running 置为 true
 	running   bool
 
 	// 日志记录, 默认值: DefaultLogger
@@ -33,6 +37,9 @@ type Cron struct {
 	// 默认: standardParser
 	parser    ScheduleParser
 	nextID    EntryID
+
+	// 每启动一个 goroutine 运行 Job 就加 1
+	// 在调用 Stop() 函数停止调度时,会等待正在运行的 goroutine 运行结束
 	jobWaiter sync.WaitGroup
 }
 
@@ -67,6 +74,7 @@ type EntryID int
 type Entry struct {
 	// ID is the cron-assigned ID of this entry, which may be used to look up a
 	// snapshot or remove it.
+	// ID 是 cron 分配给该 entyr 的 ID，可用于查找快照或删除它。
 	ID EntryID
 
 	// Schedule on which this job should be run.
@@ -74,17 +82,27 @@ type Entry struct {
 
 	// Next time the job will run, or the zero time if Cron has not been
 	// started or this entry's schedule is unsatisfiable
+	// 下次作业将运行时间，或者如果 Cron 尚未启动或此条目的计划无法满足，则为零时间
 	Next time.Time
 
 	// Prev is the last time this job was run, or the zero time if never.
+	// Prev 是上次运行此作业的时间，如果从未运行，则为零时间。
 	Prev time.Time
 
 	// WrappedJob is the thing to run when the Schedule is activated.
+	// WrappedJob 是 Schedule 被激活时运行的东西。
+	//
+	// 被 Chain 包装后的 Job
 	WrappedJob Job
 
 	// Job is the thing that was submitted to cron.
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
+	// Job 是提交给 cron 的东西。
+	// 它被保留，以便稍后需要完成工作的用户代码，
+	// 例如 通过 Entries() 可以这样做。
+	//
+	// 原始传入的Job
 	Job Job
 }
 
@@ -93,6 +111,9 @@ func (e Entry) Valid() bool { return e.ID != 0 }
 
 // byTime is a wrapper for sorting the entry array by time
 // (with zero time at the end).
+//
+// byTime 是一个包装器，用于按时间对条目数组进行排序
+//（最后时间为零）。
 type byTime []*Entry
 
 func (s byTime) Len() int      { return len(s) }
@@ -194,6 +215,8 @@ func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
+//
+// Schedule 将 Job 添加到 Cron 以按给定的 Schedule 运行。
 func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
@@ -251,6 +274,7 @@ func (c *Cron) Remove(id EntryID) {
 }
 
 // Start the cron scheduler in its own goroutine, or no-op if already started.
+// 在它自己的 goroutine 中启动 cron 调度程序，如果已经启动则无操作。
 func (c *Cron) Start() {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
@@ -275,10 +299,13 @@ func (c *Cron) Run() {
 
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
+//
+// 运行调度程序.. 这是私有的，只是因为需要同步对 “running” 状态变量的访问。
 func (c *Cron) run() {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
+	// 计算每个 entry 的下一个激活时间。
 	now := c.now()
 	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
@@ -287,6 +314,7 @@ func (c *Cron) run() {
 
 	for {
 		// Determine the next entry to run.
+		// 按 Next 时间对 entries 进行排序, 决定下一个要运行的 entry.
 		sort.Sort(byTime(c.entries))
 
 		var timer *time.Timer
@@ -295,12 +323,14 @@ func (c *Cron) run() {
 			// and stop requests.
 			timer = time.NewTimer(100000 * time.Hour)
 		} else {
+			// 定时器 = entry 将要执行时间 - now
 			timer = time.NewTimer(c.entries[0].Next.Sub(now))
 		}
 
 		for {
 			select {
 			case now = <-timer.C:
+				// 返回所在时区的时间
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
 
@@ -309,12 +339,13 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
+					c.startJob(e.WrappedJob) // 启动一个 goroutine 运行 Job
+					e.Prev = e.Next // 更新上次执行时间
+					e.Next = e.Schedule.Next(now) // 更新下次执行时间
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
+			// 有新增加的 entry,可以动态添加
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
@@ -326,11 +357,13 @@ func (c *Cron) run() {
 				replyChan <- c.entrySnapshot()
 				continue
 
+			// 停止定时任务调度, 不再启动 goroutine 运行 job
 			case <-c.stop:
 				timer.Stop()
 				c.logger.Info("stop")
 				return
 
+			//	有删除的 entry,可以动态删除
 			case id := <-c.remove:
 				timer.Stop()
 				now = c.now()
@@ -344,6 +377,7 @@ func (c *Cron) run() {
 }
 
 // startJob runs the given job in a new goroutine.
+// startJob 在新的 goroutine 中运行给定的作业。
 func (c *Cron) startJob(j Job) {
 	c.jobWaiter.Add(1)
 	go func() {
