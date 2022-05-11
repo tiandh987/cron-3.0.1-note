@@ -312,6 +312,7 @@ func (c *Cron) run() {
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
 
+	// 每调度完成一次,就会重新对 entries 进行排序
 	for {
 		// Determine the next entry to run.
 		// 按 Next 时间对 entries 进行排序, 决定下一个要运行的 entry.
